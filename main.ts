@@ -17,6 +17,16 @@
 //
 // Everything here is deterministic: insertion-ordered maps, batch order,
 // bigint arithmetic. No clock, no randomness, no environment reads.
+//
+// Speed note: the tape keeps its window statistics incrementally — the
+// window high as a monotonic deque of candidate maxima, distinct buyers
+// as a per-user count map, and the 60-slot net flow as a running sum
+// with a lazy head pointer — so deciding an entry is O(1) per mint per
+// batch instead of re-scanning the whole 2,500-slot window on every
+// batch. The decisions are identical to the scan version: the high is
+// the first point with the maximum price ratio, buyers count the same
+// live window, flow sums the same points. Expired points are dropped
+// by advancing a head index, never by Array.shift().
 
 import { runBot, LAMPORTS_PER_SOL } from './vendor/makefun-bot.ts';
 import type { Batch, BotState, OrderInput } from './vendor/makefun-bot.ts';
@@ -82,6 +92,16 @@ interface MintTape {
   createdSlot: number | null;
   devSold: boolean;
   points: TapePoint[];
+  /** First live point: points before head expired out of the window. */
+  head: number;
+  /** Indices of candidate window-high points, strictly decreasing price. */
+  highDq: number[];
+  /** Distinct buyers over the live window, with their point counts. */
+  buyers: Map<string, number>;
+  /** Net flow (buys minus sells) over the 60-slot flow window. */
+  flow: bigint;
+  /** First point still inside the 60-slot flow window. */
+  flowHead: number;
   entries: number;
   lastExitSlot: number | null;
 }
@@ -110,6 +130,11 @@ function tapeFor(mint: string): MintTape {
       createdSlot: null,
       devSold: false,
       points: [],
+      head: 0,
+      highDq: [],
+      buyers: new Map<string, number>(),
+      flow: 0n,
+      flowHead: 0,
       entries: 0,
       lastExitSlot: null,
     };
@@ -118,18 +143,20 @@ function tapeFor(mint: string): MintTape {
   return tape;
 }
 
-function hasPendingBuy(state: BotState, mint: string): boolean {
-  for (const p of state.pending.values()) {
-    if (p.order.side === 'buy' && p.order.mint === mint) return true;
-  }
-  return false;
+/** True when a's price (vq/vt) is strictly below b's. Cross-multiplied, exact. */
+function priceBelow(a: TapePoint, b: TapePoint): boolean {
+  return a.vq * b.vt < b.vq * a.vt;
 }
 
-function hasPendingSell(state: BotState, mint: string): boolean {
+/** Mints with a buy (or sell) already in flight, read once per batch. */
+function pendingMints(state: BotState): { buys: Set<string>; sells: Set<string> } {
+  const buys = new Set<string>();
+  const sells = new Set<string>();
   for (const p of state.pending.values()) {
-    if (p.order.side === 'sell' && p.order.mint === mint) return true;
+    if (p.order.side === 'buy') buys.add(p.order.mint);
+    else sells.add(p.order.mint);
   }
-  return false;
+  return { buys, sells };
 }
 
 // ---------------------------------------------------------------- batch
@@ -140,6 +167,7 @@ function onBatch(state: BotState, batch: Batch): OrderInput[] {
   const txFee = state.txFeeLamports();
   let spentThisBatch = 0n;
   const newBuys = new Set<string>();
+  const pending = pendingMints(state);
 
   // --- 1. Fold the fills that resolved since the last batch. ---
   for (const fill of batch.fills) {
@@ -201,18 +229,36 @@ function onBatch(state: BotState, batch: Batch): OrderInput[] {
         tradedToday.add(e.mint);
         tradedOrder.push(e.mint);
       }
+      // Evict expired points by advancing the head (never shift()): each
+      // point leaves the live window once, so this is amortised O(1).
       const cutoff = e.slot - HIGH_WINDOW_SLOTS;
-      while (tape.points.length > 0 && tape.points[0].slot < cutoff) {
-        tape.points.shift();
+      while (tape.head < tape.points.length && tape.points[tape.head].slot < cutoff) {
+        const old = tape.points[tape.head];
+        const n = (tape.buyers.get(old.user) ?? 0) - 1;
+        if (n <= 0) tape.buyers.delete(old.user);
+        else tape.buyers.set(old.user, n);
+        tape.head++;
+        while (tape.highDq.length > 0 && tape.highDq[0] < tape.head) tape.highDq.shift();
       }
-      tape.points.push({
+      const point: TapePoint = {
         slot: e.slot,
         isBuy: e.is_buy,
         sol: BigInt(e.sol_amount),
         user: e.user,
         vq: BigInt(e.virtual_quote_reserves),
         vt: BigInt(e.virtual_token_reserves),
-      });
+      };
+      const idx = tape.points.length;
+      tape.points.push(point);
+      tape.buyers.set(point.user, (tape.buyers.get(point.user) ?? 0) + 1);
+      // Monotonic deque: drop back candidates priced strictly below the
+      // new point, so the front stays the first point with the max price
+      // (ties keep the earlier point, exactly like the scan's strict >).
+      while (tape.highDq.length > 0 && priceBelow(tape.points[tape.highDq[tape.highDq.length - 1]], point)) {
+        tape.highDq.pop();
+      }
+      tape.highDq.push(idx);
+      tape.flow += point.isBuy ? point.sol : -point.sol;
       if (!e.is_buy && tape.creator !== null && e.user === tape.creator) {
         tape.devSold = true;
       }
@@ -228,7 +274,7 @@ function onBatch(state: BotState, batch: Batch): OrderInput[] {
   for (const [mint, held] of state.positions) {
     const info = myPositions.get(mint);
     if (info === undefined) continue;
-    if (hasPendingSell(state, mint)) continue;
+    if (pending.sells.has(mint)) continue;
     const curve = state.curves.get(mint);
     if (curve === undefined || curve.complete) continue;
     const tokens = held.token_amount;
@@ -253,11 +299,14 @@ function onBatch(state: BotState, batch: Batch): OrderInput[] {
   }
 
   // --- 4. Dip entries, only on mints that traded in this batch. ---
+  // Window statistics are read off the incremental tape state — the same
+  // values the old full-window scan computed, in O(1) per mint.
   const maxOrders = state.hello.caps.max_orders_per_batch;
+  const flowCutoff = slot - FLOW_WINDOW_SLOTS;
   for (const mint of tradedOrder) {
     if (orders.length >= maxOrders) break;
     if (state.positions.has(mint) || newBuys.has(mint)) continue;
-    if (hasPendingBuy(state, mint)) continue;
+    if (pending.buys.has(mint)) continue;
     const curve = state.curves.get(mint);
     if (curve === undefined || curve.complete) continue;
     const tape = tapes.get(mint);
@@ -267,26 +316,29 @@ function onBatch(state: BotState, batch: Batch): OrderInput[] {
     if (tape.entries > 0 && tape.lastExitSlot === null) continue;
     const realSol = curve.real_quote_reserves;
     if (realSol < MIN_REAL_SOL || realSol > MAX_REAL_SOL) continue;
-    if (tape.points.length === 0) continue;
+    if (tape.points.length - tape.head === 0) continue;
     const last = tape.points[tape.points.length - 1];
     if (!last.isBuy) continue;
 
-    // One scan: window high, distinct buyers, 60-slot net flow.
+    // Catch the flow sum up to this batch's 60-slot window. Points are
+    // in slot order, so each point's signed amount is subtracted once,
+    // exactly when it leaves the window — the same sum the scan built.
+    while (tape.flowHead < tape.points.length && tape.points[tape.flowHead].slot < flowCutoff) {
+      const pt = tape.points[tape.flowHead];
+      tape.flow -= pt.isBuy ? pt.sol : -pt.sol;
+      tape.flowHead++;
+    }
+    if (tape.buyers.size < MIN_BUYERS) continue;
+    if (tape.flow < 0n) continue;
+
+    // Window high from the deque front (0/1 when the tape is empty).
     let highQ = 0n;
     let highT = 1n;
-    const buyers = new Set<string>();
-    let flow = 0n;
-    const flowCutoff = slot - FLOW_WINDOW_SLOTS;
-    for (const pt of tape.points) {
-      if (pt.vq * highT > highQ * pt.vt) {
-        highQ = pt.vq;
-        highT = pt.vt;
-      }
-      if (pt.isBuy) buyers.add(pt.user);
-      if (pt.slot >= flowCutoff) flow += pt.isBuy ? pt.sol : -pt.sol;
+    if (tape.highDq.length > 0) {
+      const hi = tape.points[tape.highDq[0]];
+      highQ = hi.vq;
+      highT = hi.vt;
     }
-    if (buyers.size < MIN_BUYERS) continue;
-    if (flow < 0n) continue;
 
     // Dip band: current price between 60% and 80% of the window high.
     const vq = curve.virtual_quote_reserves;
@@ -331,7 +383,7 @@ function onBatch(state: BotState, batch: Batch): OrderInput[] {
         const curve = state.curves.get(mint);
         if (curve === undefined || curve.complete) continue;
         if (state.positions.has(mint) || newBuys.has(mint)) continue;
-        if (hasPendingBuy(state, mint)) continue;
+        if (pending.buys.has(mint)) continue;
         if (curve.real_quote_reserves < MIN_PROBE_REAL_SOL) continue;
         const cap = state.maxBuyLamports(mint);
         if ((cap * 97n) / 100n < PROBE_LAMPORTS) continue;
